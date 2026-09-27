@@ -1,5 +1,7 @@
 # ustc-iwan
 
+> **本分支说明**：本仓库由上游 [yyy1mu/ustc-iwan](https://github.com/yyy1mu/ustc-iwan) fork 而来。当前主要补丁面向 Windows 用户态 SOCKS5/HTTP 代理的稳定性：将 UDP `WouldBlock`/10035 视为可重试的背压，而非致命退出；同时记录特定路径可使用的 `--proxy-mtu 1200` 运行参数。不宣称所有 Windows 网络环境都需要该参数。详见 [Windows 用户态代理修复说明](doc/windows-proxy-fixes.md)。
+
 USTC iWAN 命令行客户端：通过统一身份认证（OIDC）获取线路配置，并提供三种连接方式。
 
 | 连接方式 | 平台 | 需要 root | 说明 |
@@ -20,17 +22,28 @@ SOCKS5/HTTP 模式由 smoltcp 在用户态生成完整的 TCP/IPv4 数据包，�
 
 ## 目录
 
-- [快速开始](#快速开始)
-- [安装](#安装)
-- [获取线路配置](#获取线路配置)
-- [选择线路](#选择线路)
-- [连接方式](#连接方式)
-- [高级选项](#高级选项)
-- [命令行参数](#命令行参数)
-- [手动客户端](#手动客户端)
-- [服务端](#服务端)
-- [使用技巧](#使用技巧)
-- [参与贡献](#参与贡献)
+- [ustc-iwan](#ustc-iwan)
+  - [目录](#目录)
+  - [快速开始](#快速开始)
+  - [安装](#安装)
+  - [获取线路配置](#获取线路配置)
+  - [选择线路](#选择线路)
+  - [连接方式](#连接方式)
+    - [TUN 隧道](#tun-隧道)
+    - [SOCKS5 代理](#socks5-代理)
+    - [HTTP 代理](#http-代理)
+  - [高级选项](#高级选项)
+    - [域名解析](#域名解析)
+    - [网络接口绑定](#网络接口绑定)
+    - [MTU](#mtu)
+    - [性能调优](#性能调优)
+    - [调试输出](#调试输出)
+  - [命令行参数](#命令行参数)
+  - [手动客户端](#手动客户端)
+  - [服务端](#服务端)
+  - [使用技巧](#使用技巧)
+  - [参与贡献](#参与贡献)
+  - [免责声明](#免责声明)
 
 ## 快速开始
 
@@ -52,7 +65,7 @@ sudo ./iwan-client-oidc --connect            # TUN 隧道
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/yyy1mu/ustc-iwan/releases) 下载对应平台的压缩包：
+从 [上游原版 GitHub Releases](https://github.com/yyy1mu/ustc-iwan/releases) 下载对应平台的压缩包：
 
 ```text
 iwan-client-oidc-linux-x86_64-musl      iwan-client-oidc-linux-aarch64-musl
@@ -63,6 +76,8 @@ iwan-client-oidc-windows-x86_64.exe     iwan-client-oidc-windows-aarch64.exe
 - Linux 的 musl 产物为静态链接，可直接运行；另有 gnu/armv7/riscv64 等变体。
 - macOS 的 Intel 机器选 `x86_64`，Apple Silicon 选 `aarch64`。
 - 手动客户端 `iwan-client` 有对应平台的产物；测试服务端 `iwan-server` 仅提供 Linux 产物。
+- 上游原版产物不包含本分支补丁。需要修复版时，请构建本仓库源码；本分支如发布修复版二进制，可从本仓库 Releases 下载。
+- Windows 用户态代理的修复版构建、运行参数与验证边界见 [Windows 用户态代理修复说明](doc/windows-proxy-fixes.md)。
 
 从源码构建：
 

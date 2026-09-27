@@ -2,11 +2,24 @@ use super::IpTunnelDevice;
 use crate::core::{crypto, protocol};
 use anyhow::{Context, Result};
 use smoltcp::wire::{IpAddress, Ipv4Packet, TcpPacket};
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::{Duration, Instant};
 
 pub(crate) const VPN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+pub(crate) const CONTROL_QUEUE_CAPACITY: usize = 64;
+
+pub(crate) struct ControlPacket {
+    bytes: Vec<u8>,
+    is_keepalive: bool,
+}
+
+pub(crate) enum SendStatus {
+    Sent,
+    Blocked,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn receive_vpn(
@@ -18,9 +31,13 @@ pub(crate) fn receive_vpn(
     mtu: usize,
     encryption: u8,
     session_started: Instant,
+    control_queue: &mut VecDeque<ControlPacket>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65535];
     loop {
+        if !device.has_rx_capacity() || control_queue.len() >= CONTROL_QUEUE_CAPACITY {
+            return Ok(());
+        }
         match sock.recv(&mut buf) {
             Ok(n) if n >= 8 => {
                 let packet_type = buf[0];
@@ -42,8 +59,10 @@ pub(crate) fn receive_vpn(
                 }
                 if packet_type == protocol::PT_ECHO_REQ {
                     let header = protocol::pkhdr(protocol::PT_ECHO_RES, encryption, sid, token);
-                    sock.send(&protocol::ctrl_pkt(&header, &[]))
-                        .context("send VPN keepalive response")?;
+                    control_queue.push_back(ControlPacket {
+                        bytes: protocol::ctrl_pkt(&header, &[]),
+                        is_keepalive: false,
+                    });
                     continue;
                 }
                 if packet_type != protocol::PT_DATA && packet_type != protocol::PT_DATA_ENC {
@@ -65,21 +84,24 @@ pub(crate) fn receive_vpn(
     }
 }
 
-pub(crate) fn send_vpn_keepalive(
-    sock: &UdpSocket,
+pub(crate) fn enqueue_vpn_keepalive(
     sid: u16,
     token: u32,
     encryption: u8,
-    last_keepalive: &mut Instant,
-) -> Result<()> {
-    if last_keepalive.elapsed() < VPN_KEEPALIVE_INTERVAL {
-        return Ok(());
+    last_keepalive: Instant,
+    control_queue: &mut VecDeque<ControlPacket>,
+) {
+    if last_keepalive.elapsed() < VPN_KEEPALIVE_INTERVAL
+        || control_queue.iter().any(|packet| packet.is_keepalive)
+        || control_queue.len() == CONTROL_QUEUE_CAPACITY
+    {
+        return;
     }
     let header = protocol::pkhdr(protocol::PT_ECHO_REQ, encryption, sid, token);
-    sock.send(&protocol::ctrl_pkt(&header, &[]))
-        .context("send VPN keepalive")?;
-    *last_keepalive = Instant::now();
-    Ok(())
+    control_queue.push_back(ControlPacket {
+        bytes: protocol::ctrl_pkt(&header, &[]),
+        is_keepalive: true,
+    });
 }
 
 pub(crate) fn send_vpn(
@@ -89,20 +111,91 @@ pub(crate) fn send_vpn(
     sid: u16,
     token: u32,
     encryption: u8,
-) -> Result<()> {
-    while let Some(mut packet) = device.pop_tx_packet() {
-        log_tcp_packet("VPN TX", &packet);
-        let packet_type = if encryption == 0 {
-            protocol::PT_DATA
-        } else {
-            crypto::xor(&mut packet, xor_key);
-            protocol::PT_DATA_ENC
-        };
-        let header = protocol::pkhdr(packet_type, encryption, sid, token);
-        sock.send(&protocol::data_pkt(&header, &packet))
-            .context("send VPN packet")?;
+) -> Result<SendStatus> {
+    loop {
+        match send_next_vpn_packet(device, xor_key, sid, token, encryption, |packet| {
+            sock.send(packet)
+        })
+        .context("send VPN packet")?
+        {
+            Some(SendStatus::Sent) => continue,
+            Some(SendStatus::Blocked) => return Ok(SendStatus::Blocked),
+            None => return Ok(SendStatus::Sent),
+        }
     }
-    Ok(())
+}
+
+pub(crate) fn send_vpn_control(
+    sock: &UdpSocket,
+    control_queue: &mut VecDeque<ControlPacket>,
+) -> Result<Option<bool>> {
+    send_next_control_packet(control_queue, |packet| sock.send(packet))
+        .context("send VPN control packet")
+}
+
+fn send_next_vpn_packet<F>(
+    device: &mut IpTunnelDevice,
+    xor_key: &[u8],
+    sid: u16,
+    token: u32,
+    encryption: u8,
+    send: F,
+) -> Result<Option<SendStatus>>
+where
+    F: FnOnce(&[u8]) -> std::io::Result<usize>,
+{
+    let Some(packet) = device.peek_tx_packet() else {
+        return Ok(None);
+    };
+    log_tcp_packet("VPN TX", packet);
+    let mut payload = packet.to_vec();
+    let packet_type = if encryption == 0 {
+        protocol::PT_DATA
+    } else {
+        crypto::xor(&mut payload, xor_key);
+        protocol::PT_DATA_ENC
+    };
+    let header = protocol::pkhdr(packet_type, encryption, sid, token);
+    let wire_packet = protocol::data_pkt(&header, &payload);
+    match send_datagram(&wire_packet, send)? {
+        SendStatus::Sent => {
+            let _ = device.pop_tx_packet();
+            Ok(Some(SendStatus::Sent))
+        }
+        SendStatus::Blocked => Ok(Some(SendStatus::Blocked)),
+    }
+}
+
+fn send_next_control_packet<F>(
+    control_queue: &mut VecDeque<ControlPacket>,
+    send: F,
+) -> Result<Option<bool>>
+where
+    F: FnOnce(&[u8]) -> std::io::Result<usize>,
+{
+    let Some(packet) = control_queue.front() else {
+        return Ok(Some(false));
+    };
+    if matches!(send_datagram(&packet.bytes, send)?, SendStatus::Blocked) {
+        return Ok(None);
+    }
+    let is_keepalive = control_queue
+        .pop_front()
+        .expect("control packet disappeared during send")
+        .is_keepalive;
+    Ok(Some(is_keepalive))
+}
+
+fn send_datagram<F>(packet: &[u8], send: F) -> Result<SendStatus>
+where
+    F: FnOnce(&[u8]) -> std::io::Result<usize>,
+{
+    match send(packet) {
+        Ok(n) if n == packet.len() => Ok(SendStatus::Sent),
+        Ok(n) => anyhow::bail!("partial UDP datagram send: {n} of {} bytes", packet.len()),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(SendStatus::Blocked),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn validate_inner_ipv4(packet: &[u8], mtu: usize) -> bool {
@@ -178,5 +271,53 @@ mod tests {
         ipv6[0] = 0x60;
         assert!(!validate_inner_ipv4(&ipv6, 1380));
         assert!(!validate_inner_ipv4(&[0x10; 20], 1380));
+    }
+
+    #[test]
+    fn retries_would_block_without_reencrypting_or_dropping_packet() {
+        let mut device = IpTunnelDevice::new(1380);
+        let original = vec![0x45, 0, 1, 2, 3];
+        device.push_tx_packet(original.clone());
+        let key = [0xa5, 0x5a];
+        let blocked = send_next_vpn_packet(&mut device, &key, 1, 2, 1, |_| {
+            Err(std::io::Error::from(ErrorKind::WouldBlock))
+        })
+        .unwrap();
+        assert!(matches!(blocked, Some(SendStatus::Blocked)));
+        assert_eq!(device.peek_tx_packet(), Some(original.as_slice()));
+
+        let mut retried = Vec::new();
+        let sent = send_next_vpn_packet(&mut device, &key, 1, 2, 1, |packet| {
+            retried.extend_from_slice(packet);
+            Ok(packet.len())
+        })
+        .unwrap();
+        assert!(matches!(sent, Some(SendStatus::Sent)));
+        assert_eq!(device.peek_tx_packet(), None);
+        let mut expected_payload = original;
+        crypto::xor(&mut expected_payload, &key);
+        let header = protocol::pkhdr(protocol::PT_DATA_ENC, 1, 1, 2);
+        assert_eq!(retried, protocol::data_pkt(&header, &expected_payload));
+    }
+
+    #[test]
+    fn keeps_queued_keepalive_after_would_block() {
+        let mut queue = VecDeque::new();
+        enqueue_vpn_keepalive(1, 2, 0, Instant::now() - VPN_KEEPALIVE_INTERVAL, &mut queue);
+        enqueue_vpn_keepalive(1, 2, 0, Instant::now() - VPN_KEEPALIVE_INTERVAL, &mut queue);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            send_next_control_packet(&mut queue, |_| Err(std::io::Error::from(
+                ErrorKind::WouldBlock
+            )))
+            .unwrap(),
+            None
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            send_next_control_packet(&mut queue, |packet| Ok(packet.len())).unwrap(),
+            Some(true)
+        );
+        assert!(queue.is_empty());
     }
 }
